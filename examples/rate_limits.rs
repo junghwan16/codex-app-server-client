@@ -9,7 +9,7 @@ async fn main() -> Result<(), String> {
     let limits = client.rate_limits().await?;
 
     let Some(codex) = limits.codex() else {
-        println!("rate limit 정보 없음");
+        println!("no rate limit info");
         return Ok(());
     };
 
@@ -18,7 +18,7 @@ async fn main() -> Result<(), String> {
 
     if let Some(primary) = &codex.primary {
         println!("used     {}%", primary.used_percent);
-        println!("window   {}분", primary.window_duration_mins);
+        println!("window   {} min", primary.window_duration_mins);
         println!("resets   {}", primary.resets_at);
     }
 

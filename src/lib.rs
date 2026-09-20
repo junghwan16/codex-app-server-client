@@ -18,7 +18,7 @@ pub struct ProcessConnection<W, R> {
     next_id: u64,
 }
 
-/// `codex app-server` 자식 프로세스
+/// A `ProcessConnection` attached to a `codex app-server` child process.
 pub type ChildConnection = ProcessConnection<ChildStdin, BufReader<ChildStdout>>;
 
 impl<W, R> ProcessConnection<W, R> {
@@ -32,7 +32,7 @@ impl<W, R> ProcessConnection<W, R> {
 }
 
 impl ChildConnection {
-    /// 주어진 커맨드를 stdin/stdout 파이프로 띄우고 그 위에 연결을 만든다.
+    /// Spawns the given command with piped stdin/stdout and connects over them.
     pub async fn spawn(mut command: Command) -> Result<Self, String> {
         let mut child = command
             .stdin(Stdio::piped())
@@ -75,8 +75,8 @@ where
 
         self.send(&build_request(id, method, params)).await?;
 
-        // 응답이 오기 전에 서버가 보내는 notification은 건너뛴다.
-        // TODO: 여기서 무한 루프 돌아서 문제 생기는 케이스는 없을까? 타임아웃을 주는건?
+        // Skip notifications the server sends before the matching response.
+        // TODO: could this spin forever? Consider adding a timeout.
         let mut line = String::new();
         loop {
             line.clear();
@@ -116,7 +116,8 @@ impl<C: Connection> CodexClient<C> {
         Self { connection }
     }
 
-    /// `initialize` 요청과 `initialized` 요청으로 핸드셰이크
+    /// Completes the handshake with an `initialize` request and an
+    /// `initialized` notification.
     pub async fn connect(mut connection: C) -> Result<Self, String> {
         connection
             .request(
@@ -145,7 +146,7 @@ impl<C: Connection> CodexClient<C> {
 }
 
 impl CodexClient<ChildConnection> {
-    /// `codex app-server`를 띄우고 연결한다.
+    /// Spawns `codex app-server` and connects to it.
     pub async fn spawn() -> Result<Self, String> {
         let mut command = Command::new("codex");
         command.arg("app-server");
@@ -193,10 +194,10 @@ pub struct Credits {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RateLimit {
-    /// 서버가 소수점 값을 보내므로 f64로 받는다.
+    /// The server sends fractional values, so this is an f64.
     pub used_percent: f64,
     pub window_duration_mins: u32,
-    /// 창이 초기화되는 시각 (unix epoch seconds).
+    /// When the window resets (unix epoch seconds).
     pub resets_at: u64,
 }
 
@@ -257,7 +258,7 @@ mod tests {
     type ServerReader = BufReader<ReadHalf<DuplexStream>>;
     type ServerWriter = WriteHalf<DuplexStream>;
 
-    /// 가짜 서버 <> 클라이언트 구조를 Fake하기 위해 사용한다.
+    /// Builds a fake server <> client pair over an in-memory duplex stream.
     fn connected_pair() -> (TestConnection, ServerReader, ServerWriter) {
         let (client_io, server_io) = tokio::io::duplex(1024);
 
@@ -271,7 +272,7 @@ mod tests {
         )
     }
 
-    /// 한 줄을 읽어 JSON으로 파싱한다.
+    /// Reads one line and parses it as JSON.
     async fn read_json(reader: &mut ServerReader) -> Value {
         let mut line = String::new();
         reader.read_line(&mut line).await.unwrap();
@@ -316,7 +317,7 @@ mod tests {
 
         let client = CodexClient::connect(connection).await.unwrap();
 
-        // initialize가 요청되었음을 검증
+        // Verify that initialize was requested.
         assert_eq!(client.connection.requests, vec!["initialize"]);
         assert_eq!(client.connection.notifications, vec!["initialized"]);
 
@@ -389,7 +390,7 @@ mod tests {
                 .unwrap();
         });
 
-        // 봉투(id/result)는 벗겨지고 result만 돌아온다.
+        // The envelope (id/result) is stripped; only result comes back.
         let response = connection.request("initialize", None).await.unwrap();
 
         assert_eq!(response, serde_json::json!({ "ok": true }));
@@ -397,7 +398,7 @@ mod tests {
         server.await.unwrap();
     }
 
-    // 사실 이것 때문에 이 프로젝트를 시작했다.
+    // This is actually the reason this project exists.
     #[tokio::test]
     async fn request_skips_notification_before_response() {
         let (mut connection, mut server_reader, mut server_writer) = connected_pair();
@@ -430,7 +431,7 @@ mod tests {
         let server = tokio::spawn(async move {
             read_json(&mut server_reader).await;
 
-            // 응답 없이 서버의 write side를 명시적으로 닫는다.
+            // Close the server's write side without replying.
             server_writer.shutdown().await.unwrap();
         });
 
