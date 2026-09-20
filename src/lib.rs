@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use serde::Deserialize;
+use serde_json::Value;
 
 trait Connection {
     /**
@@ -9,7 +10,8 @@ trait Connection {
      *   .request("accoutn/rateLimits/read")
      *   .await?
      */
-    async fn request(&mut self, method: &str) -> Result<String, String>;
+    async fn request(&mut self, method: &str, params: Option<Value>) -> Result<String, String>;
+
     async fn notify(&mut self, method: &str) -> Result<(), String>;
 }
 
@@ -19,7 +21,17 @@ struct CodexClient<C> {
 
 impl<C: Connection> CodexClient<C> {
     async fn connect(mut connection: C) -> Result<Self, String> {
-        connection.request("initialize").await?;
+        connection
+            .request(
+                "initialize",
+                Some(serde_json::json!({
+                    "clientInfo": {
+                        "name": "codex-app-server-client",
+                        "version": env!("CARGO_PKG_VERSION"),
+                    }
+                })),
+            )
+            .await?;
         connection.notify("initialized").await?;
 
         Ok(Self { connection })
@@ -60,7 +72,10 @@ impl<C: Connection> CodexClient<C> {
     }
 
     async fn rate_limits(&mut self) -> Result<RateLimitResponse, String> {
-        let response = self.connection.request("account/rateLimits/read").await?;
+        let response = self
+            .connection
+            .request("account/rateLimits/read", None)
+            .await?;
 
         serde_json::from_str(&response).map_err(|err| err.to_string())
     }
@@ -73,6 +88,7 @@ mod tests {
     struct FakeConnection {
         response: String,
         requests: Vec<String>,
+        request_params: Vec<Option<Value>>,
         notifications: Vec<String>,
     }
 
@@ -81,19 +97,23 @@ mod tests {
             Self {
                 response: response.to_string(),
                 requests: vec![],
+                request_params: vec![],
                 notifications: vec![],
             }
         }
     }
 
     impl Connection for FakeConnection {
-        async fn request(&mut self, method: &str) -> Result<String, String> {
+        async fn request(&mut self, method: &str, params: Option<Value>) -> Result<String, String> {
             self.requests.push(method.to_string());
+            self.request_params.push(params);
+
             Ok(self.response.clone())
         }
 
         async fn notify(&mut self, method: &str) -> Result<(), String> {
             self.notifications.push(method.to_string());
+
             Ok(())
         }
     }
@@ -132,15 +152,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connects_to_app_server() {
-        let connection = FakeConnection::new("{}");
-
-        let res = CodexClient::connect(connection).await;
-
-        assert!(res.is_ok());
-    }
-
-    #[tokio::test]
     async fn connect_sends_initialize_request() {
         let connection = FakeConnection::new("{}");
 
@@ -149,5 +160,15 @@ mod tests {
         // initialize가 요청되었음을 검증
         assert_eq!(client.connection.requests, vec!["initialize"]);
         assert_eq!(client.connection.notifications, vec!["initialized"]);
+
+        assert_eq!(
+            client.connection.request_params[0],
+            Some(serde_json::json!({
+                "clientInfo": {
+                    "name": "codex-app-server-client",
+                    "version": env!("CARGO_PKG_VERSION")
+                }
+            }))
+        );
     }
 }
