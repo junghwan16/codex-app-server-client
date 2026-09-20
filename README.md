@@ -2,13 +2,13 @@
 
 Rust client for the Codex app-server protocol.
 
-> 상태: 설계 중. 아래 API는 목표 형태이며 아직 구현되어 있지 않습니다.
+> 상태: `spawn` / `rate_limits`까지 구현됨. 예제는 `cargo run --example rate_limits`.
 
 ## 목표 API
 
 ```rust
 // initialize => initialized
-let client = CodexClient::spawn().await?;
+let mut client = CodexClient::spawn().await?;
 
 let limits = client.rate_limits().await?;
 ```

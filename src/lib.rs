@@ -1,19 +1,25 @@
 use std::collections::HashMap;
+use std::process::Stdio;
 
 use serde::Deserialize;
 use serde_json::Value;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::process::{ChildStdin, ChildStdout, Command};
 
-trait Connection {
-    async fn request(&mut self, method: &str, params: Option<Value>) -> Result<String, String>;
+#[allow(async_fn_in_trait)]
+pub trait Connection {
+    async fn request(&mut self, method: &str, params: Option<Value>) -> Result<Value, String>;
     async fn notify(&mut self, method: &str) -> Result<(), String>;
 }
 
-struct ProcessConnection<W, R> {
+pub struct ProcessConnection<W, R> {
     writer: W,
     reader: R,
     next_id: u64,
 }
+
+/// `codex app-server` 자식 프로세스
+pub type ChildConnection = ProcessConnection<ChildStdin, BufReader<ChildStdout>>;
 
 impl<W, R> ProcessConnection<W, R> {
     fn new(writer: W, reader: R) -> Self {
@@ -25,71 +31,93 @@ impl<W, R> ProcessConnection<W, R> {
     }
 }
 
+impl ChildConnection {
+    /// 주어진 커맨드를 stdin/stdout 파이프로 띄우고 그 위에 연결을 만든다.
+    pub async fn spawn(mut command: Command) -> Result<Self, String> {
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .map_err(|err| err.to_string())?;
+
+        let stdin = child.stdin.take().ok_or("failed to open codex stdin")?;
+        let stdout = child.stdout.take().ok_or("failed to open codex stdout")?;
+
+        Ok(Self::new(stdin, BufReader::new(stdout)))
+    }
+}
+
+impl<W, R> ProcessConnection<W, R>
+where
+    W: AsyncWrite + Unpin,
+{
+    async fn send(&mut self, message: &Value) -> Result<(), String> {
+        let mut bytes = serde_json::to_vec(message).map_err(|err| err.to_string())?;
+        bytes.push(b'\n');
+
+        self.writer
+            .write_all(&bytes)
+            .await
+            .map_err(|err| err.to_string())?;
+
+        self.writer.flush().await.map_err(|err| err.to_string())
+    }
+}
+
 impl<W, R> Connection for ProcessConnection<W, R>
 where
     W: AsyncWrite + Unpin,
     R: AsyncBufRead + Unpin,
 {
-    async fn request(&mut self, method: &str, params: Option<Value>) -> Result<String, String> {
+    async fn request(&mut self, method: &str, params: Option<Value>) -> Result<Value, String> {
         let id = self.next_id;
         self.next_id += 1;
 
-        let message = build_request(1, method, params);
+        self.send(&build_request(id, method, params)).await?;
 
-        let mut bytes = serde_json::to_vec(&message).map_err(|err| err.to_string())?;
-        bytes.push(b'\n');
-
-        self.writer
-            .write_all(&bytes)
-            .await
-            .map_err(|err| err.to_string())?;
-
-        self.writer.flush().await.map_err(|err| err.to_string())?;
-
+        // 응답이 오기 전에 서버가 보내는 notification은 건너뛴다.
         // TODO: 여기서 무한 루프 돌아서 문제 생기는 케이스는 없을까? 타임아웃을 주는건?
+        let mut line = String::new();
         loop {
-            let mut response = String::new();
+            line.clear();
 
-            self.reader
-                .read_line(&mut response)
+            let bytes_read = self
+                .reader
+                .read_line(&mut line)
                 .await
                 .map_err(|err| err.to_string())?;
+            if bytes_read == 0 {
+                return Err("connection closed".to_string());
+            }
 
-            let message: Value =
-                serde_json::from_str(response.trim_end()).map_err(|err| err.to_string())?;
+            let mut message: Value =
+                serde_json::from_str(line.trim_end()).map_err(|err| err.to_string())?;
 
             if message.get("id").and_then(Value::as_u64) == Some(id) {
-                return Ok(response.trim_end().to_string());
+                return Ok(message
+                    .get_mut("result")
+                    .map(Value::take)
+                    .unwrap_or(Value::Null));
             }
         }
     }
 
     async fn notify(&mut self, method: &str) -> Result<(), String> {
-        let message = serde_json::json!({
-            "method": method
-        });
-
-        let mut bytes = serde_json::to_vec(&message).map_err(|err| err.to_string())?;
-
-        bytes.push(b'\n');
-
-        self.writer
-            .write_all(&bytes)
-            .await
-            .map_err(|err| err.to_string())?;
-
-        self.writer.flush().await.map_err(|err| err.to_string())?;
-
-        Ok(())
+        self.send(&serde_json::json!({ "method": method })).await
     }
 }
 
-struct CodexClient<C> {
+pub struct CodexClient<C> {
     connection: C,
 }
 
 impl<C: Connection> CodexClient<C> {
-    async fn connect(mut connection: C) -> Result<Self, String> {
+    fn new(connection: C) -> Self {
+        Self { connection }
+    }
+
+    /// `initialize` 요청과 `initialized` 요청으로 핸드셰이크
+    pub async fn connect(mut connection: C) -> Result<Self, String> {
         connection
             .request(
                 "initialize",
@@ -103,51 +131,73 @@ impl<C: Connection> CodexClient<C> {
             .await?;
         connection.notify("initialized").await?;
 
-        Ok(Self { connection })
+        Ok(Self::new(connection))
+    }
+
+    pub async fn rate_limits(&mut self) -> Result<RateLimitResponse, String> {
+        let result = self
+            .connection
+            .request("account/rateLimits/read", None)
+            .await?;
+
+        serde_json::from_value(result).map_err(|err| err.to_string())
+    }
+}
+
+impl CodexClient<ChildConnection> {
+    /// `codex app-server`를 띄우고 연결한다.
+    pub async fn spawn() -> Result<Self, String> {
+        let mut command = Command::new("codex");
+        command.arg("app-server");
+
+        Self::connect(ChildConnection::spawn(command).await?).await
     }
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct RateLimitResponse {
+pub struct RateLimitResponse {
+    pub account_id: Option<String>,
     rate_limits_by_limit_id: Option<HashMap<String, LimitGroup>>,
 }
 
 impl RateLimitResponse {
-    fn codex(&self) -> Option<&LimitGroup> {
+    pub fn codex(&self) -> Option<&LimitGroup> {
         self.rate_limits_by_limit_id.as_ref()?.get("codex")
     }
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct LimitGroup {
-    limit_id: Option<String>,
-    primary: Option<RateLimit>,
-    secondary: Option<RateLimit>,
+pub struct LimitGroup {
+    pub limit_id: Option<String>,
+    pub limit_name: Option<String>,
+    pub plan_type: Option<String>,
+    pub primary: Option<RateLimit>,
+    pub secondary: Option<RateLimit>,
+    pub credits: Option<Credits>,
+    #[serde(default)]
+    pub spend_control_reached: bool,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct RateLimit {
-    used_percent: u8,
-    window_duration_mins: u32,
-    resets_at: u64,
+pub struct Credits {
+    #[serde(default)]
+    pub has_credits: bool,
+    #[serde(default)]
+    pub unlimited: bool,
+    pub balance: Option<String>,
 }
 
-impl<C: Connection> CodexClient<C> {
-    fn new(connection: C) -> Self {
-        Self { connection }
-    }
-
-    async fn rate_limits(&mut self) -> Result<RateLimitResponse, String> {
-        let response = self
-            .connection
-            .request("account/rateLimits/read", None)
-            .await?;
-
-        serde_json::from_str(&response).map_err(|err| err.to_string())
-    }
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RateLimit {
+    /// 서버가 소수점 값을 보내므로 f64로 받는다.
+    pub used_percent: f64,
+    pub window_duration_mins: u32,
+    /// 창이 초기화되는 시각 (unix epoch seconds).
+    pub resets_at: u64,
 }
 
 fn build_request(id: u64, method: &str, params: Option<Value>) -> Value {
@@ -167,17 +217,19 @@ fn build_request(id: u64, method: &str, params: Option<Value>) -> Value {
 mod tests {
     use super::*;
 
+    use tokio::io::{DuplexStream, ReadHalf, WriteHalf};
+
     struct FakeConnection {
-        response: String,
+        result: Value,
         requests: Vec<String>,
         request_params: Vec<Option<Value>>,
         notifications: Vec<String>,
     }
 
     impl FakeConnection {
-        fn new(response: &str) -> Self {
+        fn new(result: Value) -> Self {
             Self {
-                response: response.to_string(),
+                result,
                 requests: vec![],
                 request_params: vec![],
                 notifications: vec![],
@@ -186,11 +238,11 @@ mod tests {
     }
 
     impl Connection for FakeConnection {
-        async fn request(&mut self, method: &str, params: Option<Value>) -> Result<String, String> {
+        async fn request(&mut self, method: &str, params: Option<Value>) -> Result<Value, String> {
             self.requests.push(method.to_string());
             self.request_params.push(params);
 
-            Ok(self.response.clone())
+            Ok(self.result.clone())
         }
 
         async fn notify(&mut self, method: &str) -> Result<(), String> {
@@ -200,22 +252,47 @@ mod tests {
         }
     }
 
+    type TestConnection =
+        ProcessConnection<WriteHalf<DuplexStream>, BufReader<ReadHalf<DuplexStream>>>;
+    type ServerReader = BufReader<ReadHalf<DuplexStream>>;
+    type ServerWriter = WriteHalf<DuplexStream>;
+
+    /// 가짜 서버 <> 클라이언트 구조를 Fake하기 위해 사용한다.
+    fn connected_pair() -> (TestConnection, ServerReader, ServerWriter) {
+        let (client_io, server_io) = tokio::io::duplex(1024);
+
+        let (client_reader, client_writer) = tokio::io::split(client_io);
+        let (server_reader, server_writer) = tokio::io::split(server_io);
+
+        (
+            ProcessConnection::new(client_writer, BufReader::new(client_reader)),
+            BufReader::new(server_reader),
+            server_writer,
+        )
+    }
+
+    /// 한 줄을 읽어 JSON으로 파싱한다.
+    async fn read_json(reader: &mut ServerReader) -> Value {
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+
+        serde_json::from_str(line.trim()).unwrap()
+    }
+
     #[tokio::test]
     async fn reads_rate_limits_through_connection() {
-        let connection = FakeConnection::new(
-            r#"{
-                "rateLimitsByLimitId": {
-                    "codex": {
-                        "primary": {
-                            "usedPercent": 25,
-                            "windowDurationMins": 300,
-                            "resetsAt": 123
-                        },
-                        "secondary": null
-                    }
+        let connection = FakeConnection::new(serde_json::json!({
+            "rateLimitsByLimitId": {
+                "codex": {
+                    "primary": {
+                        "usedPercent": 25,
+                        "windowDurationMins": 300,
+                        "resetsAt": 123
+                    },
+                    "secondary": null
                 }
-            }"#,
-        );
+            }
+        }));
 
         let mut client = CodexClient::new(connection);
 
@@ -229,13 +306,13 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .used_percent,
-            25
+            25.0
         );
     }
 
     #[tokio::test]
     async fn connect_sends_initialize_request() {
-        let connection = FakeConnection::new("{}");
+        let connection = FakeConnection::new(serde_json::json!({}));
 
         let client = CodexClient::connect(connection).await.unwrap();
 
@@ -293,26 +370,13 @@ mod tests {
         );
     }
 
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-
     #[tokio::test]
     async fn process_connection_sends_request_and_reads_response() {
-        // 가짜 서버 <> 클라이언트 구조를 Fake하기 위해 사용한다.
-        let (client_io, server_io) = tokio::io::duplex(1024);
-
-        let (client_reader, client_writer) = tokio::io::split(client_io);
-        let (server_reader, mut server_writer) = tokio::io::split(server_io);
+        let (mut connection, mut server_reader, mut server_writer) = connected_pair();
 
         let server = tokio::spawn(async move {
-            let mut reader = BufReader::new(server_reader);
-            let mut line = String::new();
-
-            reader.read_line(&mut line).await.unwrap();
-
-            let request: Value = serde_json::from_str(line.trim()).unwrap();
-
             assert_eq!(
-                request,
+                read_json(&mut server_reader).await,
                 serde_json::json!({
                     "id": 1,
                     "method": "initialize"
@@ -320,24 +384,15 @@ mod tests {
             );
 
             server_writer
-                .write_all(b"{\"id\":1,\"result\":{}}\n")
+                .write_all(b"{\"id\":1,\"result\":{\"ok\":true}}\n")
                 .await
                 .unwrap();
         });
 
-        let mut connection = ProcessConnection::new(client_writer, BufReader::new(client_reader));
-
+        // 봉투(id/result)는 벗겨지고 result만 돌아온다.
         let response = connection.request("initialize", None).await.unwrap();
 
-        let response: Value = serde_json::from_str(&response).unwrap();
-
-        assert_eq!(
-            response,
-            serde_json::json!({
-                "id": 1,
-                "result": {}
-            })
-        );
+        assert_eq!(response, serde_json::json!({ "ok": true }));
 
         server.await.unwrap();
     }
@@ -345,16 +400,10 @@ mod tests {
     // 사실 이것 때문에 이 프로젝트를 시작했다.
     #[tokio::test]
     async fn request_skips_notification_before_response() {
-        let (client_io, server_io) = tokio::io::duplex(1024);
-
-        let (client_reader, client_writer) = tokio::io::split(client_io);
-        let (server_reader, mut server_writer) = tokio::io::split(server_io);
+        let (mut connection, mut server_reader, mut server_writer) = connected_pair();
 
         let server = tokio::spawn(async move {
-            let mut reader = BufReader::new(server_reader);
-            let mut line = String::new();
-
-            reader.read_line(&mut line).await.unwrap();
+            read_json(&mut server_reader).await;
 
             server_writer
                 .write_all(b"{\"method\":\"remoteControl/status/changed\",\"params\":{}}\n")
@@ -367,21 +416,53 @@ mod tests {
                 .unwrap();
         });
 
-        let mut connection = ProcessConnection::new(client_writer, BufReader::new(client_reader));
-
         let response = connection.request("initialize", None).await.unwrap();
 
-        let response: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response, serde_json::json!({ "ok": true }));
 
-        assert_eq!(
-            response,
-            serde_json::json!({
-                "id": 1,
-                "result": {
-                    "ok": true
-                }
-            })
-        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_returns_error_when_connection_closes_before_response() {
+        let (mut connection, mut server_reader, mut server_writer) = connected_pair();
+
+        let server = tokio::spawn(async move {
+            read_json(&mut server_reader).await;
+
+            // 응답 없이 서버의 write side를 명시적으로 닫는다.
+            server_writer.shutdown().await.unwrap();
+        });
+
+        let result = connection.request("initialize", None).await;
+
+        assert_eq!(result, Err("connection closed".to_string()));
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_increments_request_id() {
+        let (mut connection, mut server_reader, mut server_writer) = connected_pair();
+
+        let server = tokio::spawn(async move {
+            assert_eq!(read_json(&mut server_reader).await["id"], 1);
+
+            server_writer
+                .write_all(b"{\"id\":1,\"result\":{}}\n")
+                .await
+                .unwrap();
+
+            assert_eq!(read_json(&mut server_reader).await["id"], 2);
+
+            server_writer
+                .write_all(b"{\"id\":2,\"result\":{}}\n")
+                .await
+                .unwrap();
+        });
+
+        connection.request("first", None).await.unwrap();
+        connection.request("second", None).await.unwrap();
 
         server.await.unwrap();
     }
