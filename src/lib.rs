@@ -10,10 +10,20 @@ trait Connection {
      *   .await?
      */
     async fn request(&mut self, method: &str) -> Result<String, String>;
+    async fn notify(&mut self, method: &str) -> Result<(), String>;
 }
 
 struct CodexClient<C> {
     connection: C,
+}
+
+impl<C: Connection> CodexClient<C> {
+    async fn connect(mut connection: C) -> Result<Self, String> {
+        connection.request("initialize").await?;
+        connection.notify("initialized").await?;
+
+        Ok(Self { connection })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -62,19 +72,29 @@ mod tests {
 
     struct FakeConnection {
         response: String,
+        requests: Vec<String>,
+        notifications: Vec<String>,
     }
 
     impl FakeConnection {
         fn new(response: &str) -> Self {
             Self {
                 response: response.to_string(),
+                requests: vec![],
+                notifications: vec![],
             }
         }
     }
 
     impl Connection for FakeConnection {
         async fn request(&mut self, method: &str) -> Result<String, String> {
+            self.requests.push(method.to_string());
             Ok(self.response.clone())
+        }
+
+        async fn notify(&mut self, method: &str) -> Result<(), String> {
+            self.notifications.push(method.to_string());
+            Ok(())
         }
     }
 
@@ -109,5 +129,25 @@ mod tests {
                 .used_percent,
             25
         );
+    }
+
+    #[tokio::test]
+    async fn connects_to_app_server() {
+        let connection = FakeConnection::new("{}");
+
+        let res = CodexClient::connect(connection).await;
+
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn connect_sends_initialize_request() {
+        let connection = FakeConnection::new("{}");
+
+        let client = CodexClient::connect(connection).await.unwrap();
+
+        // initialize가 요청되었음을 검증
+        assert_eq!(client.connection.requests, vec!["initialize"]);
+        assert_eq!(client.connection.notifications, vec!["initialized"]);
     }
 }
