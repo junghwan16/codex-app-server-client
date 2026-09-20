@@ -18,8 +18,11 @@ async fn main() -> Result<(), String> {
 
     if let Some(primary) = &codex.primary {
         println!("used     {}%", primary.used_percent);
-        println!("window   {} min", primary.window_duration_mins);
-        println!("resets   {}", primary.resets_at);
+        println!(
+            "window   {}",
+            opt(primary.window_duration_mins.map(|m| format!("{m} min")))
+        );
+        println!("resets   {}", opt(primary.resets_at));
     }
 
     if let Some(credits) = &codex.credits {
@@ -27,4 +30,10 @@ async fn main() -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn opt<T: std::fmt::Display>(value: Option<T>) -> String {
+    value
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "-".to_string())
 }

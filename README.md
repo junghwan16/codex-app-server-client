@@ -7,7 +7,6 @@ Rust client for the Codex app-server protocol.
 ## Usage
 
 ```rust
-// initialize => initialized
 let mut client = CodexClient::spawn().await?;
 
 let limits = client.rate_limits().await?;

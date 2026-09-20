@@ -93,7 +93,12 @@ where
             let mut message: Value =
                 serde_json::from_str(line.trim_end()).map_err(|err| err.to_string())?;
 
-            if message.get("id").and_then(Value::as_u64) == Some(id) {
+            if matches_id(message.get("id"), id) {
+                // The server answers a request with either `result` or `error`.
+                if let Some(error) = message.get_mut("error") {
+                    return Err(describe_error(&error.take()));
+                }
+
                 return Ok(message
                     .get_mut("result")
                     .map(Value::take)
@@ -196,9 +201,32 @@ pub struct Credits {
 pub struct RateLimit {
     /// The server sends fractional values, so this is an f64.
     pub used_percent: f64,
-    pub window_duration_mins: u32,
-    /// When the window resets (unix epoch seconds).
-    pub resets_at: u64,
+    /// Absent for windows the server does not scope to a duration.
+    pub window_duration_mins: Option<i64>,
+    /// When the window resets (unix epoch seconds). Absent when unknown.
+    pub resets_at: Option<i64>,
+}
+
+/// A request id comes back as a number, but the protocol also permits a string.
+fn matches_id(value: Option<&Value>, id: u64) -> bool {
+    match value {
+        Some(Value::Number(number)) => number.as_u64() == Some(id),
+        Some(Value::String(text)) => text.parse::<u64>() == Ok(id),
+        _ => false,
+    }
+}
+
+/// Renders a JSON-RPC `error` object as `app-server error <code>: <message>`.
+fn describe_error(error: &Value) -> String {
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown error");
+
+    match error.get("code").and_then(Value::as_i64) {
+        Some(code) => format!("app-server error {code}: {message}"),
+        None => format!("app-server error: {message}"),
+    }
 }
 
 fn build_request(id: u64, method: &str, params: Option<Value>) -> Value {
@@ -309,6 +337,44 @@ mod tests {
                 .used_percent,
             25.0
         );
+    }
+
+    #[tokio::test]
+    async fn reads_rate_limits_without_window_fields() {
+        let connection = FakeConnection::new(serde_json::json!({
+            "rateLimitsByLimitId": {
+                "codex": { "primary": { "usedPercent": 12.5 } }
+            }
+        }));
+
+        let mut client = CodexClient::new(connection);
+
+        let limits = client.rate_limits().await.unwrap();
+        let primary = limits.codex().unwrap().primary.as_ref().unwrap();
+
+        assert_eq!(primary.used_percent, 12.5);
+        assert_eq!(primary.window_duration_mins, None);
+        assert_eq!(primary.resets_at, None);
+    }
+
+    #[tokio::test]
+    async fn request_matches_string_id() {
+        let (mut connection, mut server_reader, mut server_writer) = connected_pair();
+
+        let server = tokio::spawn(async move {
+            read_json(&mut server_reader).await;
+
+            server_writer
+                .write_all(b"{\"id\":\"1\",\"result\":{\"ok\":true}}\n")
+                .await
+                .unwrap();
+        });
+
+        let response = connection.request("initialize", None).await.unwrap();
+
+        assert_eq!(response, serde_json::json!({ "ok": true }));
+
+        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -438,6 +504,31 @@ mod tests {
         let result = connection.request("initialize", None).await;
 
         assert_eq!(result, Err("connection closed".to_string()));
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_returns_error_response_as_err() {
+        let (mut connection, mut server_reader, mut server_writer) = connected_pair();
+
+        let server = tokio::spawn(async move {
+            read_json(&mut server_reader).await;
+
+            server_writer
+                .write_all(
+                    b"{\"id\":1,\"error\":{\"code\":-32601,\"message\":\"method not found\"}}\n",
+                )
+                .await
+                .unwrap();
+        });
+
+        let result = connection.request("nope", None).await;
+
+        assert_eq!(
+            result,
+            Err("app-server error -32601: method not found".to_string())
+        );
 
         server.await.unwrap();
     }
