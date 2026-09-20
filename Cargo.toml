@@ -2,6 +2,13 @@
 name = "codex-app-server-client"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+description = "Rust client for the Codex app-server JSON-RPC protocol"
+license = "MIT"
+repository = "https://github.com/junghwan16/codex-app-server-client"
+readme = "README.md"
+keywords = ["codex", "app-server", "jsonrpc", "client", "tokio"]
+categories = ["api-bindings", "asynchronous"]
 
 [dependencies]
 serde = { version = "1.0.229", features = ["derive"] }
